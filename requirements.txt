@@ -1,0 +1,2 @@
+﻿polars>=1.38.1
+xlsxwriter>=3.2.9

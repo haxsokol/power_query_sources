@@ -1,0 +1,7 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.tmdl
+*.xlsx
+toml_files/
+find_source_excel/
