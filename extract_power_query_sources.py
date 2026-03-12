@@ -37,6 +37,7 @@ KNOWN_FUNCTIONS = [
     "Folder.Contents",
     "SharePoint.Files",
     "SharePoint.Contents",
+    "SharePoint.Tables",
     "Web.Contents",
     "Odbc.Query",
     "Odbc.DataSource",
@@ -64,6 +65,7 @@ SOURCE_TYPE_NAMES = {
     "Folder.Contents": "Folder",
     "SharePoint.Files": "SharePoint",
     "SharePoint.Contents": "SharePoint",
+    "SharePoint.Tables": "SharePoint",
     "Web.Contents": "Web",
     "Odbc.Query": "ODBC",
     "Odbc.DataSource": "ODBC",
@@ -89,12 +91,18 @@ FUNCTION_RE = re.compile(
     re.IGNORECASE,
 )
 PARTITION_RE = re.compile(r"(?im)^\s*partition\s+(?P<name>.+?)\s*=\s*m\s*$")
+EXPRESSION_RE = re.compile(
+    r"(?im)^(?P<indent>\s*)expression\s+(?P<name>.+?)\s*=\s*(?P<tail>.*)$"
+)
 QUERY_GROUP_RE = re.compile(r"(?im)^\s*queryGroup:\s*(?P<value>.+?)\s*$")
 SOURCE_RE = re.compile(r"(?im)^\s*source\s*=")
+SOURCE_LINE_RE = re.compile(
+    r"^(?P<indent>\s*)source\s*=\s*(?P<tail>.*)$", re.IGNORECASE
+)
 QUERY_OPTION_RE = re.compile(r'\bQuery\s*=\s*("(?:[^"]|"")*")', re.IGNORECASE)
 NAVIGATION_RE = re.compile(
-    r"\{\s*\[(?P<body>[^\]]*(?:\"(?:[^\"]|\"\")*\"[^\]]*)*)\]\s*\}\s*\[Data\]",
-    re.IGNORECASE,
+    r"\{\s*\[(?P<body>.*?)\]\s*\}\s*\[Data\]",
+    re.IGNORECASE | re.DOTALL,
 )
 KEY_VALUE_RE = re.compile(r'(\w+)\s*=\s*("(?:[^"]|"")*")', re.IGNORECASE)
 CONNECTION_RE = re.compile(r"^\s*([^=]+?)\s*=\s*(.*?)\s*$")
@@ -109,6 +117,22 @@ SQL_OBJECT_RE = re.compile(
     )
     """,
     re.VERBOSE,
+)
+SQL_NON_TABLE_OBJECTS = {
+    "LATERAL",
+    "UNNEST",
+    "VALUES",
+    "TABLE",
+    "SELECT",
+}
+
+
+QUERY_ORDER_RE = re.compile(
+    r"(?is)annotation\s+PBI_QueryOrder\s*=\s*\[(?P<body>.*?)\]"
+)
+QUERY_ORDER_ITEM_RE = re.compile(r'"((?:[^"]|"")*)"')
+GUID_SUFFIX_RE = re.compile(
+    r"-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"
 )
 
 
@@ -148,7 +172,7 @@ def parse_args() -> argparse.Namespace:
         "input_path",
         nargs="?",
         default=None,
-        help="Путь к .tmdl файлу или директории с .tmdl. Если не задан, берется PQS_INPUT_PATH или toml_files рядом со скриптом.",
+        help="Путь к .tmdl файлу или директории с .tmdl. Если не задан, берется PQS_INPUT_PATH или tmdl_files рядом со скриптом.",
     )
     parser.add_argument(
         "-o",
@@ -297,24 +321,247 @@ def clean_sql_object(value: str) -> str:
 
 
 def extract_sql_tables(query_text: str) -> list[str]:
+    query_text = strip_sql_comments(query_text or "")
+    cte_names = extract_cte_names(query_text)
+
     tables: list[str] = []
     seen: set[str] = set()
-    for match in SQL_OBJECT_RE.finditer(query_text or ""):
+    for match in SQL_OBJECT_RE.finditer(query_text):
         table_name = clean_sql_object(match.group("object"))
-        if table_name and table_name not in seen:
+        if not table_name:
+            continue
+
+        table_key = table_name.casefold()
+        if table_key in cte_names:
+            continue
+
+        first_part = table_name.split(".", 1)[0].strip().upper()
+        if first_part in SQL_NON_TABLE_OBJECTS:
+            continue
+
+        if table_name not in seen:
             seen.add(table_name)
             tables.append(table_name)
     return tables
 
 
+def strip_sql_comments(text: str) -> str:
+    if not text:
+        return ""
+
+    result: list[str] = []
+    i = 0
+    in_single = False
+    in_double = False
+    length = len(text)
+
+    while i < length:
+        char = text[i]
+        nxt = text[i + 1] if i + 1 < length else ""
+
+        if in_single:
+            result.append(char)
+            if char == "'" and nxt == "'":
+                result.append(nxt)
+                i += 2
+                continue
+            if char == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_double:
+            result.append(char)
+            if char == '"' and nxt == '"':
+                result.append(nxt)
+                i += 2
+                continue
+            if char == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if char == "-" and nxt == "-":
+            i += 2
+            while i < length and text[i] not in "\r\n":
+                i += 1
+            continue
+
+        if char == "/" and nxt == "*":
+            i += 2
+            while i + 1 < length and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = i + 2 if i + 1 < length else length
+            continue
+
+        if char == "'":
+            in_single = True
+        elif char == '"':
+            in_double = True
+
+        result.append(char)
+        i += 1
+
+    return "".join(result)
+
+
+def skip_sql_whitespace(text: str, start: int) -> int:
+    i = start
+    while i < len(text) and text[i].isspace():
+        i += 1
+    return i
+
+
+def parse_sql_identifier(text: str, start: int) -> tuple[str, int]:
+    i = skip_sql_whitespace(text, start)
+    if i >= len(text):
+        return "", i
+
+    char = text[i]
+    if char == '"':
+        j = i + 1
+        while j < len(text):
+            if text[j] == '"':
+                if j + 1 < len(text) and text[j + 1] == '"':
+                    j += 2
+                    continue
+                return text[i : j + 1], j + 1
+            j += 1
+        return "", i
+
+    if char == "[":
+        j = text.find("]", i + 1)
+        return (text[i : j + 1], j + 1) if j != -1 else ("", i)
+
+    if char == "`":
+        j = text.find("`", i + 1)
+        return (text[i : j + 1], j + 1) if j != -1 else ("", i)
+
+    if re.match(r"[A-Za-z_]", char):
+        j = i + 1
+        while j < len(text) and re.match(r"[A-Za-z0-9_$#@]", text[j]):
+            j += 1
+        return text[i:j], j
+
+    return "", i
+
+
+def find_matching_paren_sql(text: str, open_index: int) -> int:
+    if open_index < 0 or open_index >= len(text) or text[open_index] != "(":
+        return -1
+
+    depth = 0
+    in_single = False
+    in_double = False
+    i = open_index
+
+    while i < len(text):
+        char = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_single:
+            if char == "'" and nxt == "'":
+                i += 2
+                continue
+            if char == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_double:
+            if char == '"' and nxt == '"':
+                i += 2
+                continue
+            if char == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if char == "'":
+            in_single = True
+            i += 1
+            continue
+
+        if char == '"':
+            in_double = True
+            i += 1
+            continue
+
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+
+        i += 1
+
+    return -1
+
+
+def extract_cte_names(query_text: str) -> set[str]:
+    text = query_text or ""
+    i = skip_sql_whitespace(text, 0)
+    if text[i : i + 4].casefold() != "with":
+        return set()
+
+    i += 4
+    i = skip_sql_whitespace(text, i)
+    if text[i : i + 9].casefold() == "recursive":
+        i += 9
+
+    cte_names: set[str] = set()
+
+    while i < len(text):
+        name_token, i = parse_sql_identifier(text, i)
+        if not name_token:
+            break
+
+        cte_name = strip_identifier_quotes(name_token).strip().casefold()
+        if cte_name:
+            cte_names.add(cte_name)
+
+        i = skip_sql_whitespace(text, i)
+        if i < len(text) and text[i] == "(":
+            close_columns = find_matching_paren_sql(text, i)
+            if close_columns == -1:
+                break
+            i = close_columns + 1
+
+        i = skip_sql_whitespace(text, i)
+        if text[i : i + 2].casefold() != "as":
+            break
+        i += 2
+
+        i = skip_sql_whitespace(text, i)
+        if i >= len(text) or text[i] != "(":
+            break
+
+        close_body = find_matching_paren_sql(text, i)
+        if close_body == -1:
+            break
+        i = close_body + 1
+
+        i = skip_sql_whitespace(text, i)
+        if i < len(text) and text[i] == ",":
+            i += 1
+            continue
+        break
+
+    return cte_names
+
 def extract_query_option(arguments_text: str) -> str:
     match = QUERY_OPTION_RE.search(arguments_text)
-    return normalize_sql(match.group(1)) if match else ""
+    return decode_m_string(match.group(1)) if match else ""
 
 
 def extract_navigation_object(block_text: str) -> str:
+    if "{[" not in block_text or "[Data]" not in block_text:
+        return ""
+
     found: list[str] = []
-    for match in NAVIGATION_RE.finditer(block_text):
+    scan_text = block_text[:50000]
+    for match in NAVIGATION_RE.finditer(scan_text):
         values = {
             k.lower(): decode_m_string(v)
             for k, v in KEY_VALUE_RE.findall(match.group("body"))
@@ -408,7 +655,7 @@ def parse_connector(
         )
         info["db_name"] = props.get("database") or props.get("initial catalog", "")
         if len(parts) > 1:
-            tables = extract_sql_tables(normalize_sql(parts[1]))
+            tables = extract_sql_tables(decode_m_string(parts[1]))
     elif lower_name == "odbc.datasource":
         props = parse_connection_string(decode_m_string(parts[0]) if parts else "")
         info["server"] = (
@@ -433,6 +680,7 @@ def parse_connector(
         "folder.contents",
         "sharepoint.files",
         "sharepoint.contents",
+        "sharepoint.tables",
         "web.contents",
     }:
         info["file_path"] = decode_m_string(parts[0]) if parts else ""
@@ -452,7 +700,7 @@ def parse_source_call(
         return parse_connector(function_name, arguments_text, block_text)
 
     parts = split_top_level(arguments_text)
-    query_text = normalize_sql(parts[1]) if len(parts) > 1 else ""
+    query_text = decode_m_string(parts[1]) if len(parts) > 1 else ""
     tables = extract_sql_tables(query_text)
     object_name = extract_navigation_object(block_text)
 
@@ -485,21 +733,101 @@ def iter_partition_blocks(text: str):
         if not source_match:
             continue
         query_group_match = QUERY_GROUP_RE.search(block_text)
+        source_text = extract_partition_source_text(block_text)
+        if not source_text.strip():
+            continue
         yield {
             "power_query": match.group("name").strip(),
             "query_group": (
                 query_group_match.group("value").strip() if query_group_match else ""
             ),
-            "source_text": block_text[source_match.start() :],
+            "source_text": source_text,
         }
 
+
+def extract_partition_source_text(block_text: str) -> str:
+    lines = block_text.splitlines()
+    for index, line in enumerate(lines):
+        match = SOURCE_LINE_RE.match(line)
+        if not match:
+            continue
+
+        base_indent = len(match.group("indent").expandtabs(4))
+        collected = [match.group("tail")]
+
+        for next_line in lines[index + 1 :]:
+            if not next_line.strip():
+                collected.append(next_line)
+                continue
+
+            next_indent = len(re.match(r"^\s*", next_line).group(0).expandtabs(4))
+            if next_indent <= base_indent:
+                break
+
+            collected.append(next_line)
+
+        return "\n".join(collected)
+    return ""
+
+
+def iter_expression_blocks(text: str):
+    matches = list(EXPRESSION_RE.finditer(text))
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block_text = text[start:end]
+        query_group_match = QUERY_GROUP_RE.search(block_text)
+        source_text = extract_expression_source_text(block_text)
+        if not source_text.strip():
+            continue
+        yield {
+            "power_query": match.group("name").strip(),
+            "query_group": (
+                query_group_match.group("value").strip() if query_group_match else ""
+            ),
+            "source_text": source_text,
+        }
+
+
+def extract_expression_source_text(block_text: str) -> str:
+    lines = block_text.splitlines()
+    for index, line in enumerate(lines):
+        first_line_match = EXPRESSION_RE.match(line)
+        if not first_line_match:
+            continue
+
+        base_indent = len(first_line_match.group("indent").expandtabs(4))
+        collected = [first_line_match.group("tail")]
+
+        for next_line in lines[index + 1 :]:
+            if not next_line.strip():
+                collected.append(next_line)
+                continue
+
+            next_indent = len(re.match(r"^\s*", next_line).group(0).expandtabs(4))
+            if next_indent <= base_indent and re.match(
+                r"^\s*(lineageTag:|queryGroup:|annotation\s+)",
+                next_line,
+                re.IGNORECASE,
+            ):
+                break
+
+            collected.append(next_line)
+
+        return "\n".join(collected)
+
+    return ""
+
+def iter_query_blocks(text: str):
+    yield from iter_partition_blocks(text)
+    yield from iter_expression_blocks(text)
 
 def collect_rows(text: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen: set[tuple[str, ...]] = set()
 
-    for partition in iter_partition_blocks(text):
-        source_text = partition["source_text"]
+    for query_block in iter_query_blocks(text):
+        source_text = query_block["source_text"]
         skip_until = 0
 
         for match in FUNCTION_RE.finditer(source_text):
@@ -512,16 +840,27 @@ def collect_rows(text: str) -> list[dict[str, str]]:
                 continue
 
             _, arguments_text, end_index = call
-            info = parse_source_call(function_name, arguments_text, source_text)
+            context_end = min(len(source_text), match.start() + 20000)
+            context_text = source_text[match.start() : context_end]
+            info = parse_source_call(function_name, arguments_text, context_text)
             tables = info.get("tables") or [""]
 
             for table_name in tables:
+                db_name = str(info.get("db_name", ""))
+                if "bw2hana" in str(table_name).casefold():
+                    db_name = "SAP HANA"
+                normalized_table_name = str(table_name)
+                if db_name.casefold() == "kot":
+                    normalized_table_name = re.sub(
+                        r"(?i)^public\.", "", normalized_table_name
+                    )
+
                 row = {
-                    "PowerQuery": str(partition["power_query"]),
-                    "Группа": str(partition["query_group"]),
+                    "PowerQuery": str(query_block["power_query"]),
+                    "Группа": str(query_block["query_group"]),
                     "Источник": str(info.get("source_type", "")),
-                    "ИмяБД": str(info.get("db_name", "")),
-                    "ТаблицаВБД": str(table_name),
+                    "ИмяБД": db_name,
+                    "ТаблицаВБД": normalized_table_name,
                     "Сервер": str(info.get("server", "")),
                     "ПутьКФайлу": str(info.get("file_path", "")),
                     "Объект": str(info.get("object_name", "")),
@@ -559,6 +898,56 @@ def deduplicate_by_table(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         unique_rows.append(row)
 
     return unique_rows
+
+
+def extract_query_order_names(text: str) -> list[str]:
+    match = QUERY_ORDER_RE.search(text)
+    if not match:
+        return []
+
+    body = match.group("body")
+    names = [item.replace('""', '"').strip() for item in QUERY_ORDER_ITEM_RE.findall(body)]
+    return [name for name in names if name]
+
+
+def strip_outer_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def clean_power_query_name(value: str) -> str:
+    value = strip_outer_quotes(value)
+    value = GUID_SUFFIX_RE.sub("", value).strip()
+    return normalize_whitespace(value)
+
+
+def build_query_order_lookup(query_order_names: list[str]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for name in query_order_names:
+        cleaned = clean_power_query_name(name)
+        if cleaned:
+            lookup.setdefault(cleaned.casefold(), cleaned)
+    return lookup
+
+
+def apply_query_order_names(rows: list[dict[str, str]], query_order_names: list[str]) -> list[dict[str, str]]:
+    if not rows:
+        return rows
+
+    lookup = build_query_order_lookup(query_order_names)
+    updated_rows: list[dict[str, str]] = []
+
+    for row in rows:
+        cleaned_name = clean_power_query_name(str(row.get("PowerQuery", "")))
+        mapped_name = lookup.get(cleaned_name.casefold(), cleaned_name)
+
+        updated_row = dict(row)
+        updated_row["PowerQuery"] = mapped_name or str(row.get("PowerQuery", ""))
+        updated_rows.append(updated_row)
+
+    return updated_rows
 
 
 def discover_tmdl_files(input_path: Path, pattern: str) -> list[Path]:
@@ -640,7 +1029,7 @@ def main() -> int:
     input_from_cli = args.input_path is not None
     output_from_cli = args.output_dir is not None
 
-    input_value = args.input_path if input_from_cli else (os.getenv("PQS_INPUT_PATH") or "toml_files")
+    input_value = args.input_path if input_from_cli else (os.getenv("PQS_INPUT_PATH") or "tmdl_files")
     output_value = args.output_dir if output_from_cli else (os.getenv("PQS_OUTPUT_DIR") or "find_source_excel")
     glob_pattern = args.glob or os.getenv("PQS_GLOB") or "*.tmdl"
 
@@ -668,7 +1057,10 @@ def main() -> int:
             print(f"[ERROR] {toml_path}: {error}", file=sys.stderr)
             continue
 
-        rows = deduplicate_by_table(collect_rows(text))
+        query_order_names = extract_query_order_names(text)
+        rows = collect_rows(text)
+        rows = apply_query_order_names(rows, query_order_names)
+        rows = deduplicate_by_table(rows)
         dataframe = build_dataframe(rows)
         output_path = resolve_output_path(toml_path, output_dir, occupied_outputs)
         actual_output_path = write_excel(dataframe, output_path)

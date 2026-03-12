@@ -3,5 +3,5 @@ __pycache__/
 *.pyc
 *.tmdl
 *.xlsx
-toml_files/
+tmdl_files/
 find_source_excel/

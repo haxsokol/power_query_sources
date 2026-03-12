@@ -6,7 +6,7 @@
 
 После запуска `setup.sh` или `setup.ps1` автоматически создаются папки:
 
-- `toml_files` — сюда кладем `.tmdl`
+- `tmdl_files` — сюда кладем `.tmdl`
 - `find_source_excel` — сюда складываются итоговые `.xlsx`
 
 ## 1. Подготовка окружения
@@ -35,7 +35,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ## 2. Куда класть TMDL и где смотреть Excel
 
-1. Скопируйте `.tmdl` файлы в папку `toml_files`.
+1. Скопируйте `.tmdl` файлы в папку `tmdl_files`.
 2. Запустите скрипт.
 3. Готовые Excel-файлы будут в `find_source_excel`.
 
@@ -61,7 +61,7 @@ source .venv/Scripts/activate
 .\.venv\Scripts\Activate.ps1
 ```
 
-Запуск по умолчанию (берет TMDL из `toml_files`, пишет Excel в `find_source_excel`):
+Запуск по умолчанию (берет TMDL из `tmdl_files`, пишет Excel в `find_source_excel`):
 
 ```bash
 python extract_power_query_sources.py
@@ -73,12 +73,22 @@ python extract_power_query_sources.py
 python extract_power_query_sources.py ../some_dir --output-dir ../another_dir
 ```
 
-## 4. Переменные `.env`
+## 4. Особенности парсинга
+
+- Имена запросов в колонке `PowerQuery` приводятся к корректным названиям из `annotation PBI_QueryOrder` (если аннотация есть в файле).
+- Технические суффиксы вида `-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` и внешние кавычки у имен запросов автоматически убираются.
+- Поддерживаются основные источники, включая `SharePoint.Tables`.
+- Для SAP HANA-объектов вида `_SYS_BIC...bw2hana/...` в колонке `ИмяБД` автоматически проставляется `SAP HANA`.
+- CTE-алиасы из SQL (`WITH ... AS (...)`) не попадают в `ТаблицаВБД`.
+- `JOIN LATERAL` обрабатывается корректно: `LATERAL` не считается таблицей, но источники внутри lateral-подзапросов извлекаются.
+- Источники извлекаются отдельно из `partition ... source = ...` и `expression ... = ...`, чтобы запросы не "подмешивались" друг в друга.
+
+## 5. Переменные `.env`
 
 Файл `.env` подхватывается автоматически. Текущие значения по умолчанию:
 
 ```dotenv
-PQS_INPUT_PATH=toml_files
+PQS_INPUT_PATH=tmdl_files
 PQS_OUTPUT_DIR=find_source_excel
 PQS_GLOB=*.tmdl
 ```

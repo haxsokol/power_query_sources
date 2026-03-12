@@ -88,11 +88,11 @@ if (-not [System.IO.Path]::IsPathRooted($venvDir)) {
     $venvDir = Join-Path $scriptDir $venvDir
 }
 
-$tomlDir = Join-Path $scriptDir "toml_files"
+$tmdlDir = Join-Path $scriptDir "tmdl_files"
 $outputDir = Join-Path $scriptDir "find_source_excel"
 
 & $pythonExe @pythonPrefixArgs -m venv $venvDir
-New-Item -ItemType Directory -Force -Path $tomlDir | Out-Null
+New-Item -ItemType Directory -Force -Path $tmdlDir | Out-Null
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
@@ -118,7 +118,7 @@ else {
 }
 
 Write-Host "Environment is ready."
-Write-Host "Created folders: $tomlDir and $outputDir"
-Write-Host "Put TOML files into: $tomlDir"
+Write-Host "Created folders: $tmdlDir and $outputDir"
+Write-Host "Put TMDL files into: $tmdlDir"
 Write-Host "Excel output will be created in: $outputDir"
 Write-Host "Activate with: `"$venvDir\Scripts\Activate.ps1`""

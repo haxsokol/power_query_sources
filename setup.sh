@@ -13,7 +13,7 @@ fi
 
 VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/.venv}"
 INDEX_URL="${1:-${CORP_PIP_INDEX_URL:-${PIP_INDEX_URL:-}}}"
-TOML_DIR="$SCRIPT_DIR/toml_files"
+TMDL_DIR="$SCRIPT_DIR/tmdl_files"
 OUTPUT_DIR="$SCRIPT_DIR/find_source_excel"
 
 choose_python() {
@@ -68,7 +68,7 @@ choose_python
 "${PYTHON_CMD[@]}" -m venv "$VENV_DIR"
 resolve_venv_python
 
-mkdir -p "$TOML_DIR" "$OUTPUT_DIR"
+mkdir -p "$TMDL_DIR" "$OUTPUT_DIR"
 
 "$VENV_PYTHON" -m pip install --upgrade pip
 
@@ -88,7 +88,7 @@ else
 fi
 
 echo "Environment is ready."
-echo "Created folders: $TOML_DIR and $OUTPUT_DIR"
-echo "Put TOML files into: $TOML_DIR"
+echo "Created folders: $TMDL_DIR and $OUTPUT_DIR"
+echo "Put TMDL files into: $TMDL_DIR"
 echo "Excel output will be created in: $OUTPUT_DIR"
 echo "Activate it with: $ACTIVATE_HINT"
